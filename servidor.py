@@ -775,13 +775,21 @@ def view_pdf(id_value):
 
         pdf_path = Path(entry.get("pdf", "")) if entry.get("pdf") else None
         if pdf_path and pdf_path.exists():
-            return send_file(pdf_path, mimetype="application/pdf")
+            response = send_file(pdf_path, mimetype="application/pdf")
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
 
         content = _r2_get_bytes(entry.get("pdf_r2_key", ""))
         if not content:
             return "PDF no encontrado", 404
 
-        return send_file(io.BytesIO(content), mimetype="application/pdf", download_name=f"{safe_id}.pdf")
+        response = send_file(io.BytesIO(content), mimetype="application/pdf", download_name=f"{safe_id}.pdf")
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
 
 if __name__ == "__main__":

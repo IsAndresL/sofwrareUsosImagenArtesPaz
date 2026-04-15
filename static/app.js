@@ -402,7 +402,7 @@ function renderExcelPreview(records) {
       const id = record.id || "";
       const isSelected = selectedSet.has(record.index);
       const isScanned = scannedSet.has(id);
-      const pdfUrl = `/pdf/${encodeURIComponent(id)}?session=${encodeURIComponent(sessionCode || "")}`;
+      const pdfUrl = `/pdf/${encodeURIComponent(id)}?session=${encodeURIComponent(sessionCode || "")}&v=${encodeURIComponent(`${state.current}-${Date.now()}`)}`;
       const actionCell = isScanned
         ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">
              <a class="btn soft" style="padding:4px 8px;font-size:0.8rem;" href="${pdfUrl}" target="_blank" rel="noopener noreferrer">Ver PDF</a>
