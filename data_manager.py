@@ -227,6 +227,36 @@ class ScanDataManager:
         self.history = []
         self.scanned_ids = []
 
+    def rescan_from_id(self, id_value):
+        target_id = str(id_value or "").strip()
+        if not target_id:
+            raise ValueError("ID invalido para reescaneo.")
+
+        selected = self.selected_records()
+        start_index = -1
+        for idx, record in enumerate(selected):
+            if str(record.get("id", "")).strip() == target_id:
+                start_index = idx
+                break
+
+        if start_index < 0:
+            raise ValueError("La persona no pertenece a la seleccion actual.")
+
+        removed_entries = self.history[start_index:]
+        self.history = self.history[:start_index]
+        self.counter = start_index
+
+        self.scanned_ids = []
+        for entry in self.history:
+            entry_id = str(entry.get("id", "")).strip()
+            if entry_id and entry_id not in self.scanned_ids:
+                self.scanned_ids.append(entry_id)
+
+        return {
+            "start_index": start_index,
+            "removed_entries": removed_entries,
+        }
+
     def export_state(self):
         return {
             "source_path": self.source_path,

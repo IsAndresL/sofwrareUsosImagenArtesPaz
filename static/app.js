@@ -43,6 +43,10 @@ const btnUploadSource = document.getElementById("btnUploadSource");
 const btnResetSession = document.getElementById("btnResetSession");
 const btnZipSession = document.getElementById("btnZipSession");
 const btnApplySelection = document.getElementById("btnApplySelection");
+const sessionCodeInput = document.getElementById("sessionCodeInput");
+const btnUseSession = document.getElementById("btnUseSession");
+const btnNewSession = document.getElementById("btnNewSession");
+const sessionBadge = document.getElementById("sessionBadge");
 
 const btnActivarCamara = document.getElementById("btnActivarCamara");
 const btnCapturar = document.getElementById("btnCapturar");
@@ -70,6 +74,8 @@ let lastUserActivityAt = Date.now();
 let lastServerPingAt = 0;
 const renderIdleSeconds = Math.max(0, Number(document.body.dataset.renderIdleSeconds || 900));
 const minPingGapMs = 15000;
+const SESSION_STORAGE_KEY = "scanner_session_code";
+let sessionCode = "";
 let state = {
   current: 0,
   total: 0,
@@ -88,6 +94,42 @@ let state = {
 function setMsg(msg, ok = true) {
   info.style.color = ok ? "#198754" : "#d64545";
   info.textContent = msg || "";
+}
+
+function normalizeSessionCode(value) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, "")
+    .trim();
+}
+
+function updateSessionBadge() {
+  if (!sessionBadge) return;
+  sessionBadge.textContent = sessionCode ? `Jornada: ${sessionCode}` : "Jornada: -";
+}
+
+function setSessionCode(code, persist = true) {
+  sessionCode = normalizeSessionCode(code);
+  if (sessionCodeInput) sessionCodeInput.value = sessionCode;
+  updateSessionBadge();
+
+  if (persist) {
+    if (sessionCode) {
+      window.localStorage.setItem(SESSION_STORAGE_KEY, sessionCode);
+    } else {
+      window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    }
+  }
+}
+
+async function apiFetch(url, options = {}) {
+  const opts = { ...options };
+  const headers = new Headers(opts.headers || {});
+  if (sessionCode) {
+    headers.set("X-Session-Code", sessionCode);
+  }
+  opts.headers = headers;
+  return fetch(url, opts);
 }
 
 function showStatus(msg, kind = "info", duration = 2200) {
@@ -171,6 +213,9 @@ function fmt(value) {
 
 function applyState(data) {
   if (!data || typeof data !== "object") return;
+  if (data.session_code) {
+    setSessionCode(data.session_code);
+  }
   state = { ...state, ...data };
 
   const sourceChanged = state.source_file !== lastSourceFile;
@@ -241,8 +286,14 @@ async function readJson(response) {
 }
 
 async function refreshStatus() {
+  if (!sessionCode) {
+    setServerOnline(false);
+    setMsg("Crea o ingresa un codigo de jornada.", false);
+    return;
+  }
+
   try {
-    const response = await fetch("/status");
+    const response = await apiFetch("/status");
     const data = await readJson(response);
     setServerOnline(true);
     const startupMessage = document.body.dataset.startupMessage || "";
@@ -258,8 +309,13 @@ async function refreshStatus() {
 }
 
 async function heartbeatStatus() {
+  if (!sessionCode) {
+    setServerOnline(false);
+    return;
+  }
+
   try {
-    const response = await fetch("/status", { cache: "no-store" });
+    const response = await apiFetch("/status", { cache: "no-store" });
     if (!response.ok) throw new Error("Status no disponible");
     setServerOnline(true);
   } catch (_err) {
@@ -346,6 +402,13 @@ function renderExcelPreview(records) {
       const id = record.id || "";
       const isSelected = selectedSet.has(record.index);
       const isScanned = scannedSet.has(id);
+      const pdfUrl = `/pdf/${encodeURIComponent(id)}?session=${encodeURIComponent(sessionCode || "")}`;
+      const actionCell = isScanned
+        ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">
+             <a class="btn soft" style="padding:4px 8px;font-size:0.8rem;" href="${pdfUrl}" target="_blank" rel="noopener noreferrer">Ver PDF</a>
+             <button class="btn warn row-rescan" style="padding:4px 8px;font-size:0.8rem;" data-id="${id}" data-name="${(name || "").replace(/"/g, "&quot;")}">Reescanear</button>
+           </div>`
+        : '<span style="color:#7d8ca5;">-</span>';
       return `
         <tr data-index="${record.index}" class="${isSelected ? "selected" : ""} ${isScanned ? "scanned" : ""}">
           <td>
@@ -355,7 +418,7 @@ function renderExcelPreview(records) {
           <td>${record.index + 1}</td>
           <td>${id}</td>
           <td>${name}</td>
-          <td>${isScanned ? `<a class="btn soft" style="padding:4px 8px;font-size:0.8rem;" href="/pdf/${encodeURIComponent(id)}" target="_blank" rel="noopener noreferrer">Ver PDF</a>` : '<span style="color:#7d8ca5;">-</span>'}</td>
+          <td>${actionCell}</td>
         </tr>
       `;
     })
@@ -396,6 +459,37 @@ function renderExcelPreview(records) {
     });
     const row = checkbox.closest("tr");
     if (row && checkbox.checked) row.classList.add("selected");
+  });
+
+  const rescanButtons = excelPreview.querySelectorAll(".row-rescan");
+  rescanButtons.forEach((button) => {
+    button.addEventListener("click", async () => {
+      const id = button.dataset.id || "";
+      const name = button.dataset.name || "";
+      const confirmMsg = name
+        ? `Se volvera a escanear ${name} (${id}) y se descartaran los escaneos posteriores. ¿Continuar?`
+        : `Se volvera a escanear ${id} y se descartaran los escaneos posteriores. ¿Continuar?`;
+
+      if (!window.confirm(confirmMsg)) return;
+
+      try {
+        const response = await apiFetch("/rescan-person", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id }),
+        });
+        const data = await readJson(response);
+        setMsg(data.msg || "Reescaneo activado.", !!data.ok);
+        showStatus(data.msg || "Reescaneo activado", data.ok ? "success" : "error");
+        if (data.ok) {
+          volverCamara();
+          await cargarVistaPrevia();
+        }
+      } catch (_err) {
+        setMsg("No se pudo activar el reescaneo.", false);
+        showStatus("No se pudo activar el reescaneo", "error");
+      }
+    });
   });
 
   const visibleCount = rows ? rows.length : 0;
@@ -491,7 +585,7 @@ async function iniciarCamara() {
 }
 
 async function cargarVistaPrevia() {
-  const response = await fetch("/preview-source");
+  const response = await apiFetch("/preview-source");
   const data = await readJson(response);
   if (data.ok && data.records) {
     renderExcelPreview(data.records);
@@ -675,7 +769,7 @@ async function usarAuto() {
     return;
   }
 
-  const response = await fetch("/auto-corners", {
+  const response = await apiFetch("/auto-corners", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ img: preview.src }),
@@ -710,7 +804,7 @@ async function enviar() {
     filter: filtro,
   };
 
-  const response = await fetch("/upload", {
+  const response = await apiFetch("/upload", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -725,7 +819,7 @@ async function enviar() {
 }
 
 async function deshacerUltimo() {
-  const response = await fetch("/undo-last", { method: "POST" });
+  const response = await apiFetch("/undo-last", { method: "POST" });
   const data = await readJson(response);
   setMsg(data.msg || "Operacion completada.", !!data.ok);
   showStatus(data.msg || "Operacion completada", data.ok ? "success" : "error");
@@ -741,7 +835,7 @@ async function subirFuente() {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch("/load-source", {
+  const response = await apiFetch("/load-source", {
     method: "POST",
     body: formData,
   });
@@ -769,7 +863,7 @@ async function aplicarSeleccion() {
   openConfirmModal(
     `Vas a bloquear la seleccion de ${selectedIndices.length} personas. Al confirmar ya no se podra editar hasta cargar otra caracterizacion.`,
     async () => {
-      const response = await fetch("/set-selection", {
+      const response = await apiFetch("/set-selection", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ selected_indices: selectedIndices }),
@@ -796,7 +890,7 @@ async function reiniciarJornada() {
   const ok = window.confirm("Se reiniciara contador e historial. Deseas continuar?");
   if (!ok) return;
 
-  const response = await fetch("/reset-session", { method: "POST" });
+  const response = await apiFetch("/reset-session", { method: "POST" });
   const data = await readJson(response);
   setMsg(data.msg || "Jornada reiniciada.", !!data.ok);
   showStatus(data.msg || "Jornada reiniciada", data.ok ? "success" : "error");
@@ -804,8 +898,13 @@ async function reiniciarJornada() {
 }
 
 function descargarZip(scope) {
+  if (!sessionCode) {
+    setMsg("Primero crea o selecciona un codigo de jornada.", false);
+    return;
+  }
   const target = scope === "all" ? "all" : "session";
-  window.open(`/download-zip?scope=${target}`, "_blank");
+  const url = `/download-zip?scope=${target}&session=${encodeURIComponent(sessionCode)}`;
+  window.open(url, "_blank");
 }
 
 function handleSearch() {
@@ -818,6 +917,43 @@ function bindIfExists(element, eventName, handler) {
   if (element) {
     element.addEventListener(eventName, handler);
   }
+}
+
+async function createSession() {
+  try {
+    const response = await fetch("/session/new", { method: "POST" });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      setMsg(data.msg || "No se pudo crear la jornada.", false);
+      return;
+    }
+
+    setSessionCode(data.session_code);
+    applyState(data);
+    if (excelPreview) {
+      excelPreview.innerHTML = '<div style="padding:12px;color:#5a6880;">Sube el Excel de caracterizacion para ver y seleccionar personas.</div>';
+    }
+    showStatus(`Jornada ${data.session_code} creada`, "success");
+    setMsg(data.msg || "Jornada creada.", true);
+  } catch (_err) {
+    setMsg("No se pudo crear la jornada.", false);
+    showStatus("Error creando jornada", "error");
+  }
+}
+
+async function useSession() {
+  const code = normalizeSessionCode(sessionCodeInput ? sessionCodeInput.value : "");
+  if (!code) {
+    setMsg("Ingresa un codigo de jornada valido.", false);
+    return;
+  }
+
+  setSessionCode(code);
+  await refreshStatus();
+  if (state.has_records) {
+    await cargarVistaPrevia();
+  }
+  showStatus(`Jornada ${code} activa`, "info");
 }
 
 overlay.addEventListener("mousedown", iniciarDrag);
@@ -834,6 +970,14 @@ bindIfExists(btnUploadSource, "click", subirFuente);
 bindIfExists(btnResetSession, "click", reiniciarJornada);
 bindIfExists(btnZipSession, "click", () => descargarZip("session"));
 bindIfExists(btnApplySelection, "click", aplicarSeleccion);
+bindIfExists(btnNewSession, "click", createSession);
+bindIfExists(btnUseSession, "click", useSession);
+bindIfExists(sessionCodeInput, "keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    useSession();
+  }
+});
 bindIfExists(searchInput, "input", handleSearch);
 bindIfExists(chkToggleAll, "change", () => updateVisibleSelection(chkToggleAll.checked));
 bindIfExists(btnCancelConfirm, "click", closeConfirmModal);
@@ -857,14 +1001,25 @@ bindIfExists(btnUndo, "click", deshacerUltimo);
 bindIfExists(btnLimpiar, "click", limpiarVista);
 
 (async function init() {
-  await refreshStatus();
+  const persistedCode = normalizeSessionCode(window.localStorage.getItem(SESSION_STORAGE_KEY) || "");
+  if (persistedCode) {
+    setSessionCode(persistedCode, false);
+    await refreshStatus();
+  } else {
+    await createSession();
+  }
+
   await heartbeatStatus();
   setupIdleTracker();
 
-  if (excelPreview) {
-    excelPreview.innerHTML = '<div style="padding:12px;color:#5a6880;">Sube el Excel de caracterizacion para ver y seleccionar personas.</div>';
+  if (state.has_records) {
+    await cargarVistaPrevia();
+  } else {
+    if (excelPreview) {
+      excelPreview.innerHTML = '<div style="padding:12px;color:#5a6880;">Sube el Excel de caracterizacion para ver y seleccionar personas.</div>';
+    }
+    if (searchInput) searchInput.disabled = true;
+    if (chkToggleAll) chkToggleAll.disabled = true;
   }
-  if (searchInput) searchInput.disabled = true;
-  if (chkToggleAll) chkToggleAll.disabled = true;
   setMsg("Pulsa Activar camara para iniciar y aceptar permisos.", true);
 })();

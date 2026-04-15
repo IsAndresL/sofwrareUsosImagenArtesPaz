@@ -1,17 +1,20 @@
 import io
 import json
 import os
+import re
+import secrets
+import string
 import threading
 import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
-import cv2
 import boto3
+import cv2
+from botocore.exceptions import ClientError
 from flask import Flask, jsonify, render_template, request, send_file
 from PIL import Image
-from botocore.exceptions import ClientError
 from werkzeug.utils import secure_filename
 
 from data_manager import ScanDataManager
@@ -35,10 +38,7 @@ for folder in [DATA_DIR, OUTPUT_DIR]:
 
 SUPPORTED_EXTENSIONS = {".xlsx", ".xls"}
 
-manager = ScanDataManager()
-startup_message = ""
-
-CLEANUP_AFTER_ZIP_SECONDS = int(os.getenv("CLEANUP_AFTER_ZIP_SECONDS", "900"))
+CLEANUP_AFTER_ZIP_SECONDS = int(os.getenv("CLEANUP_AFTER_ZIP_SECONDS", "86400"))
 INACTIVITY_CLEANUP_SECONDS = int(os.getenv("INACTIVITY_CLEANUP_SECONDS", "0"))
 CLEANUP_POLL_SECONDS = int(os.getenv("CLEANUP_POLL_SECONDS", "30"))
 RENDER_IDLE_SECONDS = int(os.getenv("RENDER_IDLE_SECONDS", "900"))
@@ -48,53 +48,13 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET = os.getenv("R2_BUCKET", "").strip()
 R2_PREFIX = os.getenv("R2_PREFIX", "scanner-usos-imagen").strip().strip("/")
-R2_STATE_KEY = f"{R2_PREFIX}/session_state.json" if R2_PREFIX else "session_state.json"
 
-_cleanup_lock = threading.Lock()
-_session_meta = {
-    "last_activity": time.time(),
-    "zip_downloaded_at": None,
-}
+SESSION_CODE_PATTERN = re.compile(r"^[A-Z0-9_-]{4,32}$")
 
+_state_lock = threading.Lock()
+_sessions = {}
 _r2_client = None
 _r2_enabled = False
-
-
-def _status_payload():
-    return manager.status()
-
-
-def _error(msg, status_code=400):
-    return jsonify({"ok": False, "msg": msg, **_status_payload()}), status_code
-
-
-def _load_default_source():
-    return None
-
-
-def _save_outputs(image_bgr, id_value):
-    pdf_path = OUTPUT_DIR / f"{id_value}.pdf"
-
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(image_rgb)
-    pdf_buffer = io.BytesIO()
-    pil_img.save(pdf_buffer, "PDF")
-    pdf_bytes = pdf_buffer.getvalue()
-    pdf_path.write_bytes(pdf_bytes)
-
-    return pdf_path, pdf_bytes
-
-
-def _build_zip_from_paths(pdf_paths):
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for path in pdf_paths:
-            p = Path(path)
-            if p.exists() and p.suffix.lower() == ".pdf":
-                zip_file.write(p, arcname=p.name)
-
-    zip_buffer.seek(0)
-    return zip_buffer
 
 
 def _safe_key_part(value):
@@ -104,6 +64,24 @@ def _safe_key_part(value):
 def _build_r2_key(*parts):
     clean_parts = [str(p).strip("/") for p in parts if str(p).strip("/")]
     return "/".join(clean_parts)
+
+
+def _r2_state_key(session_code):
+    return _build_r2_key(R2_PREFIX, "sessions", session_code, "state.json")
+
+
+def _r2_source_key(session_code, filename):
+    return _build_r2_key(
+        R2_PREFIX,
+        "sessions",
+        session_code,
+        "source",
+        f"{int(time.time())}_{_safe_key_part(filename)}",
+    )
+
+
+def _r2_pdf_key(session_code, id_value):
+    return _build_r2_key(R2_PREFIX, "sessions", session_code, "pdfs", f"{_safe_key_part(id_value)}.pdf")
 
 
 def _r2_can_use():
@@ -176,17 +154,152 @@ def _r2_delete_key(key):
         return
 
 
+def _create_context():
+    return {
+        "manager": ScanDataManager(),
+        "meta": {
+            "last_activity": time.time(),
+            "zip_downloaded_at": None,
+        },
+        "restored": False,
+    }
+
+
+def _normalize_session_code(value):
+    code = str(value or "").strip().upper()
+    if not SESSION_CODE_PATTERN.match(code):
+        return ""
+    return code
+
+
+def _generate_session_code():
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+def _get_requested_session_code():
+    code = request.headers.get("X-Session-Code", "")
+    if not code:
+        code = request.args.get("session", "")
+    if not code and request.method in {"POST", "PUT", "PATCH"}:
+        payload = request.get_json(silent=True) or {}
+        code = payload.get("session_code", "")
+    return _normalize_session_code(code)
+
+
+def _status_payload(ctx):
+    return ctx["manager"].status()
+
+
+def _error(msg, status_code=400, ctx=None):
+    payload = {"ok": False, "msg": msg}
+    if ctx is not None:
+        payload.update(_status_payload(ctx))
+    return jsonify(payload), status_code
+
+
+def _persist_state_locked(session_code, ctx):
+    if not _r2_enabled:
+        return
+
+    payload = {
+        "manager": ctx["manager"].export_state(),
+        "meta": ctx["meta"],
+    }
+    _r2_put_bytes(
+        _r2_state_key(session_code),
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        content_type="application/json",
+    )
+
+
+def _restore_state_locked(session_code, ctx):
+    if not _r2_enabled:
+        return False
+
+    raw = _r2_get_bytes(_r2_state_key(session_code))
+    if not raw:
+        return False
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return False
+
+    ctx["manager"].import_state(payload.get("manager", {}))
+    ctx["meta"] = payload.get("meta", {}) or {"last_activity": time.time(), "zip_downloaded_at": None}
+    if "last_activity" not in ctx["meta"]:
+        ctx["meta"]["last_activity"] = time.time()
+    if "zip_downloaded_at" not in ctx["meta"]:
+        ctx["meta"]["zip_downloaded_at"] = None
+    ctx["restored"] = True
+    return True
+
+
+def _get_context_locked(session_code, create_if_missing=True):
+    ctx = _sessions.get(session_code)
+    if ctx is None and create_if_missing:
+        ctx = _create_context()
+        _sessions[session_code] = ctx
+        _restore_state_locked(session_code, ctx)
+    return ctx
+
+
+def _touch_activity_locked(ctx, persist=False):
+    ctx["meta"]["last_activity"] = time.time()
+    if persist:
+        for code, value in _sessions.items():
+            if value is ctx:
+                _persist_state_locked(code, ctx)
+                break
+
+
+def _delete_entry_files(entry):
+    pdf_path = Path(entry.get("pdf", "")) if entry.get("pdf") else None
+    if pdf_path and pdf_path.exists() and pdf_path.is_file():
+        try:
+            pdf_path.unlink()
+        except Exception:
+            pass
+    _r2_delete_key(entry.get("pdf_r2_key", ""))
+
+
+def _cleanup_context_locked(session_code, ctx, reason=""):
+    manager = ctx["manager"]
+
+    if manager.source_r2_key:
+        _r2_delete_key(manager.source_r2_key)
+
+    for entry in list(manager.history):
+        _delete_entry_files(entry)
+
+    source_path = Path(manager.source_disk_path) if manager.source_disk_path else None
+    if source_path and source_path.exists() and source_path.is_file():
+        try:
+            source_path.unlink()
+        except Exception:
+            pass
+
+    manager.clear_all()
+    ctx["meta"]["zip_downloaded_at"] = None
+    _touch_activity_locked(ctx)
+    _persist_state_locked(session_code, ctx)
+
+
 def _build_zip_from_history(history_items):
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for item in history_items:
-            pdf_name = f"{item.get('id', 'archivo')}.pdf"
-            pdf_path = Path(item.get("pdf", "")) if item.get("pdf") else None
-            pdf_r2_key = item.get("pdf_r2_key", "")
+        for entry in history_items:
+            pdf_name = f"{entry.get('id', 'archivo')}.pdf"
+            pdf_path = Path(entry.get("pdf", "")) if entry.get("pdf") else None
+            pdf_r2_key = entry.get("pdf_r2_key", "")
 
             content = None
             if pdf_path and pdf_path.exists() and pdf_path.suffix.lower() == ".pdf":
-                content = pdf_path.read_bytes()
+                try:
+                    content = pdf_path.read_bytes()
+                except Exception:
+                    content = None
             elif pdf_r2_key:
                 content = _r2_get_bytes(pdf_r2_key)
 
@@ -197,111 +310,17 @@ def _build_zip_from_history(history_items):
     return zip_buffer
 
 
-def _persist_state_locked():
-    if not _r2_enabled:
-        return
+def _save_outputs(image_bgr, id_value):
+    pdf_path = OUTPUT_DIR / f"{id_value}.pdf"
 
-    payload = {
-        "manager": manager.export_state(),
-        "meta": {
-            "last_activity": _session_meta["last_activity"],
-            "zip_downloaded_at": _session_meta["zip_downloaded_at"],
-        },
-    }
-    _r2_put_bytes(
-        R2_STATE_KEY,
-        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        content_type="application/json",
-    )
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(image_rgb)
+    pdf_buffer = io.BytesIO()
+    pil_img.save(pdf_buffer, "PDF")
+    pdf_bytes = pdf_buffer.getvalue()
+    pdf_path.write_bytes(pdf_bytes)
 
-
-def _restore_state_from_r2():
-    if not _r2_enabled:
-        return False
-
-    raw = _r2_get_bytes(R2_STATE_KEY)
-    if not raw:
-        return False
-
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return False
-
-    manager.import_state(payload.get("manager", {}))
-    meta = payload.get("meta", {}) or {}
-    _session_meta["last_activity"] = float(meta.get("last_activity", time.time()))
-    _session_meta["zip_downloaded_at"] = meta.get("zip_downloaded_at")
-    return True
-
-
-def _touch_activity_locked(now=None):
-    _session_meta["last_activity"] = now if now is not None else time.time()
-
-
-def _touch_activity():
-    with _cleanup_lock:
-        _touch_activity_locked()
-
-
-def _mark_zip_downloaded():
-    with _cleanup_lock:
-        now = time.time()
-        _session_meta["zip_downloaded_at"] = now
-        _touch_activity_locked(now)
-        _persist_state_locked()
-
-
-def _collect_session_paths():
-    files = set()
-
-    for item in manager.history:
-        pdf = item.get("pdf", "")
-        if pdf:
-            files.add(Path(pdf))
-
-    if manager.source_disk_path:
-        files.add(Path(manager.source_disk_path))
-
-    return files
-
-
-def _cleanup_session_storage_locked(reason=""):
-    for file_path in _collect_session_paths():
-        try:
-            if file_path.exists() and file_path.is_file():
-                file_path.unlink()
-        except Exception:
-            continue
-
-    if manager.source_r2_key:
-        _r2_delete_key(manager.source_r2_key)
-
-    for item in manager.history:
-        _r2_delete_key(item.get("pdf_r2_key", ""))
-
-    manager.clear_all()
-    _session_meta["zip_downloaded_at"] = None
-    _touch_activity_locked()
-    _persist_state_locked()
-
-
-def _maybe_cleanup_session_files():
-    with _cleanup_lock:
-        has_session_data = bool(manager.records or manager.history or manager.source_disk_path)
-        if not has_session_data:
-            return
-
-        now = time.time()
-        zip_downloaded_at = _session_meta["zip_downloaded_at"]
-        last_activity = _session_meta["last_activity"]
-
-        if zip_downloaded_at and now - zip_downloaded_at >= CLEANUP_AFTER_ZIP_SECONDS:
-            _cleanup_session_storage_locked("after-zip")
-            return
-
-        if INACTIVITY_CLEANUP_SECONDS > 0 and now - last_activity >= INACTIVITY_CLEANUP_SECONDS:
-            _cleanup_session_storage_locked("inactivity")
+    return pdf_path, pdf_bytes
 
 
 def _cleanup_worker():
@@ -309,23 +328,34 @@ def _cleanup_worker():
     while True:
         time.sleep(interval)
         try:
-            _maybe_cleanup_session_files()
+            with _state_lock:
+                now = time.time()
+                for code, ctx in list(_sessions.items()):
+                    manager = ctx["manager"]
+                    has_session_data = bool(manager.records or manager.history or manager.source_disk_path)
+                    if not has_session_data:
+                        continue
+
+                    zip_downloaded_at = ctx["meta"].get("zip_downloaded_at")
+                    last_activity = float(ctx["meta"].get("last_activity", now))
+
+                    if zip_downloaded_at and now - float(zip_downloaded_at) >= CLEANUP_AFTER_ZIP_SECONDS:
+                        _cleanup_context_locked(code, ctx, "after-zip")
+                        continue
+
+                    if INACTIVITY_CLEANUP_SECONDS > 0 and now - last_activity >= INACTIVITY_CLEANUP_SECONDS:
+                        _cleanup_context_locked(code, ctx, "inactivity")
         except Exception:
             pass
 
 
 threading.Thread(target=_cleanup_worker, daemon=True, name="session-cleanup-worker").start()
-
-
 _r2_init()
-if _restore_state_from_r2() and manager.records:
-    startup_message = "Sesion recuperada desde R2. Puedes continuar donde ibas."
-else:
-    startup_message = "Carga el archivo de caracterizacion para comenzar."
 
 
 @app.route("/")
 def index():
+    startup_message = "Crea o ingresa un codigo de jornada para comenzar."
     return render_template(
         "index.html",
         startup_message=startup_message,
@@ -335,184 +365,283 @@ def index():
 
 @app.before_request
 def before_request_touch():
-    if request.endpoint != "static":
-        _touch_activity()
+    if request.endpoint == "static":
+        return
+
+    code = _get_requested_session_code()
+    if not code:
+        return
+
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=True)
+        _touch_activity_locked(ctx)
+
+
+@app.route("/session/new", methods=["POST"])
+def session_new():
+    with _state_lock:
+        code = _generate_session_code()
+        while code in _sessions:
+            code = _generate_session_code()
+        ctx = _create_context()
+        _sessions[code] = ctx
+        _persist_state_locked(code, ctx)
+
+    return jsonify(
+        {
+            "ok": True,
+            "session_code": code,
+            "msg": f"Jornada {code} creada.",
+            **_status_payload(ctx),
+        }
+    )
 
 
 @app.route("/status")
 def status():
-    return jsonify(_status_payload())
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
+
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=True)
+        return jsonify({"ok": True, "session_code": code, **_status_payload(ctx)})
 
 
 @app.route("/load-source", methods=["POST"])
 def load_source():
-    with _cleanup_lock:
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
+
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=True)
+        manager = ctx["manager"]
         if manager.records or manager.history or manager.source_disk_path:
-            _cleanup_session_storage_locked("new-source")
+            _cleanup_context_locked(code, ctx, "new-source")
 
     if "file" not in request.files:
-        return _error("Debes seleccionar un archivo para cargar.")
+        return _error("Debes seleccionar un archivo para cargar.", 400, ctx)
 
     file = request.files["file"]
     filename = secure_filename(file.filename or "")
     if not filename:
-        return _error("Nombre de archivo invalido.")
+        return _error("Nombre de archivo invalido.", 400, ctx)
 
     ext = Path(filename).suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
-        return _error("Formato no soportado. Usa xlsx o xls.")
+        return _error("Formato no soportado. Usa xlsx o xls.", 400, ctx)
 
-    destination = DATA_DIR / filename
+    destination = DATA_DIR / f"{code}_{filename}"
     file.save(destination)
 
-    try:
-        manager.load_source(destination)
-    except Exception as exc:
-        if destination.exists():
-            destination.unlink()
-        return _error(f"No se pudo leer el archivo: {exc}")
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=True)
+        manager = ctx["manager"]
+        try:
+            manager.load_source(destination)
+        except Exception as exc:
+            if destination.exists():
+                destination.unlink()
+            return _error(f"No se pudo leer el archivo: {exc}", 400, ctx)
 
-    if _r2_enabled:
-        source_key = _build_r2_key(R2_PREFIX, "source", f"{int(time.time())}_{_safe_key_part(filename)}")
-        if _r2_put_bytes(source_key, destination.read_bytes(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
-            manager.source_r2_key = source_key
+        if _r2_enabled:
+            source_key = _r2_source_key(code, filename)
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if _r2_put_bytes(source_key, destination.read_bytes(), content_type=content_type):
+                manager.source_r2_key = source_key
 
-    with _cleanup_lock:
-        _persist_state_locked()
+        _persist_state_locked(code, ctx)
 
-    return jsonify(
-        {
-            "ok": True,
-            "msg": f"Fuente cargada desde {filename}",
-            **_status_payload(),
-        }
-    )
+        return jsonify(
+            {
+                "ok": True,
+                "session_code": code,
+                "msg": f"Fuente cargada para jornada {code}: {filename}",
+                **_status_payload(ctx),
+            }
+        )
 
 
 @app.route("/preview-source", methods=["GET"])
 def preview_source():
-    if not manager.records:
-        return _error("Primero carga un archivo de caracterizacion.", 404)
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
 
-    return jsonify(
-        {
-            "ok": True,
-            "records": [
-                {
-                    "index": idx,
-                    "id": record.get("id", ""),
-                    "full_name": record.get("full_name", ""),
-                    "first_name": record.get("first_name", ""),
-                    "second_name": record.get("second_name", ""),
-                    "first_last_name": record.get("first_last_name", ""),
-                    "second_last_name": record.get("second_last_name", ""),
-                }
-                for idx, record in enumerate(manager.records)
-            ],
-            **_status_payload(),
-        }
-    )
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None or not ctx["manager"].records:
+            return _error("Primero carga un archivo de caracterizacion.", 404, ctx)
+
+        manager = ctx["manager"]
+        return jsonify(
+            {
+                "ok": True,
+                "session_code": code,
+                "records": [
+                    {
+                        "index": idx,
+                        "id": record.get("id", ""),
+                        "full_name": record.get("full_name", ""),
+                        "first_name": record.get("first_name", ""),
+                        "second_name": record.get("second_name", ""),
+                        "first_last_name": record.get("first_last_name", ""),
+                        "second_last_name": record.get("second_last_name", ""),
+                    }
+                    for idx, record in enumerate(manager.records)
+                ],
+                **_status_payload(ctx),
+            }
+        )
 
 
 @app.route("/set-selection", methods=["POST"])
 def set_selection():
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
+
     payload = request.json or {}
     selected_indices = payload.get("selected_indices", [])
 
-    try:
-        manager.set_selection(selected_indices)
-    except ValueError as exc:
-        return _error(str(exc))
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return _error("Jornada no encontrada.", 404)
 
-    with _cleanup_lock:
-        _persist_state_locked()
+        manager = ctx["manager"]
+        try:
+            manager.set_selection(selected_indices)
+        except ValueError as exc:
+            return _error(str(exc), 400, ctx)
 
-    return jsonify(
-        {
-            "ok": True,
-            "msg": f"Seleccion aplicada: {len(manager.selected_indices)} personas.",
-            **_status_payload(),
-        }
-    )
-
-
-@app.route("/set-target", methods=["POST"])
-def set_target():
-    payload = request.json or {}
-    try:
-        target = int(payload.get("target", 0))
-        manager.set_target(target)
-    except ValueError as exc:
-        return _error(str(exc))
-    except Exception:
-        return _error("Meta invalida.")
-
-    with _cleanup_lock:
-        _persist_state_locked()
-
-    return jsonify(
-        {
-            "ok": True,
-            "msg": f"Meta actualizada a {target}.",
-            **_status_payload(),
-        }
-    )
+        _persist_state_locked(code, ctx)
+        return jsonify(
+            {
+                "ok": True,
+                "session_code": code,
+                "msg": f"Seleccion aplicada: {len(manager.selected_indices)} personas.",
+                **_status_payload(ctx),
+            }
+        )
 
 
 @app.route("/reset-session", methods=["POST"])
 def reset_session():
-    manager.reset_session()
-    with _cleanup_lock:
-        _persist_state_locked()
-    return jsonify(
-        {
-            "ok": True,
-            "msg": "Jornada reiniciada. Contador e historial en cero.",
-            **_status_payload(),
-        }
-    )
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
+
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return _error("Jornada no encontrada.", 404)
+
+        _cleanup_context_locked(code, ctx, "manual-reset")
+        return jsonify(
+            {
+                "ok": True,
+                "session_code": code,
+                "msg": "Jornada reiniciada. Se eliminaron Excel y PDFs de la sesion.",
+                **_status_payload(ctx),
+            }
+        )
+
+
+@app.route("/rescan-person", methods=["POST"])
+def rescan_person():
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
+
+    payload = request.json or {}
+    id_value = payload.get("id", "")
+
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return _error("Jornada no encontrada.", 404)
+
+        manager = ctx["manager"]
+        try:
+            result = manager.rescan_from_id(id_value)
+        except ValueError as exc:
+            return _error(str(exc), 400, ctx)
+
+        for entry in result.get("removed_entries", []):
+            _delete_entry_files(entry)
+
+        _persist_state_locked(code, ctx)
+        return jsonify(
+            {
+                "ok": True,
+                "session_code": code,
+                "msg": f"Reescaneo activado para {id_value}. Continua desde esa persona.",
+                **_status_payload(ctx),
+            }
+        )
 
 
 @app.route("/auto-corners", methods=["POST"])
 def auto_corners():
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
+
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return _error("Jornada no encontrada.", 404)
+
     raw = (request.json or {}).get("img", "")
     if not raw:
-        return _error("Sin imagen", 400)
+        return _error("Sin imagen", 400, ctx)
 
     try:
         image = decode_data_url(raw)
         doc = detectar_documento(image)
         if doc is None:
-            return jsonify({"ok": False, "msg": "No detectado", **_status_payload()})
+            return jsonify({"ok": False, "msg": "No detectado", **_status_payload(ctx)})
 
         points = ordenar_puntos(doc.reshape(4, 2)).tolist()
-        return jsonify({"ok": True, "corners": points, **_status_payload()})
+        return jsonify({"ok": True, "corners": points, **_status_payload(ctx)})
     except ValueError as exc:
-        return _error(str(exc), 400)
+        return _error(str(exc), 400, ctx)
     except Exception:
-        return _error("Error detectando esquinas", 500)
+        return _error("Error detectando esquinas", 500, ctx)
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
+
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return _error("Jornada no encontrada.", 404)
+        manager = ctx["manager"]
+
     if manager.total() == 0:
-        return _error("No hay personas seleccionadas. Sube el Excel y aplica la seleccion.")
+        return _error("No hay personas seleccionadas. Sube el Excel y aplica la seleccion.", 400, ctx)
 
     if not manager.selection_locked:
-        return _error("Primero aplica la seleccion de personas antes de capturar.")
+        return _error("Primero aplica la seleccion de personas antes de capturar.", 400, ctx)
 
     if manager.counter >= manager.total():
-        return _error("Meta alcanzada. No puedes escanear mas.")
+        return _error("Meta alcanzada. No puedes escanear mas.", 400, ctx)
 
     payload = request.json or {}
     raw = payload.get("img", "")
     if not raw:
-        return _error("Sin imagen")
+        return _error("Sin imagen", 400, ctx)
 
     try:
         image = decode_data_url(raw)
     except Exception as exc:
-        return _error(str(exc))
+        return _error(str(exc), 400, ctx)
 
     try:
         corners = payload.get("corners")
@@ -527,34 +656,41 @@ def upload():
         image = aplicar_filtro(image, filtro)
         image = ajustar_a_carta(image)
     except Exception:
-        return _error("Error procesando imagen", 500)
+        return _error("Error procesando imagen", 500, ctx)
 
-    record = manager.current_record()
-    if record is None:
-        return _error("No hay mas registros para procesar.")
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        manager = ctx["manager"]
+        record = manager.current_record()
+        if record is None:
+            return _error("No hay mas registros para procesar.", 400, ctx)
 
-    id_value = record["id"]
+        id_value = record["id"]
 
     try:
         pdf_path, pdf_bytes = _save_outputs(image, id_value)
     except Exception:
-        return _error("No se pudo guardar el PDF", 500)
+        return _error("No se pudo guardar el PDF", 500, ctx)
 
-    pdf_r2_key = ""
-    if _r2_enabled:
-        pdf_r2_key = _build_r2_key(R2_PREFIX, "pdfs", f"{_safe_key_part(id_value)}.pdf")
-        _r2_put_bytes(pdf_r2_key, pdf_bytes, content_type="application/pdf")
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        manager = ctx["manager"]
 
-    manager.register_scan(id_value, pdf_path, pdf_r2_key=pdf_r2_key)
-    with _cleanup_lock:
-        _persist_state_locked()
-    status_payload = _status_payload()
+        pdf_r2_key = ""
+        if _r2_enabled:
+            pdf_r2_key = _r2_pdf_key(code, id_value)
+            _r2_put_bytes(pdf_r2_key, pdf_bytes, content_type="application/pdf")
+
+        manager.register_scan(id_value, pdf_path, pdf_r2_key=pdf_r2_key)
+        _persist_state_locked(code, ctx)
+        status_payload = _status_payload(ctx)
 
     display_name = record.get("full_name", "").strip()
     extra = f" - {display_name}" if display_name else ""
     return jsonify(
         {
             "ok": True,
+            "session_code": code,
             "msg": f"Guardado {id_value}.pdf{extra} ({status_payload['current']}/{status_payload['total']})",
             **status_payload,
         }
@@ -563,55 +699,54 @@ def upload():
 
 @app.route("/undo-last", methods=["POST"])
 def undo_last():
-    last = manager.undo_last()
-    if last is None:
-        return _error("No hay escaneos para deshacer.")
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
 
-    pdf_path = Path(last["pdf"])
-    if pdf_path.exists():
-        pdf_path.unlink()
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return _error("Jornada no encontrada.", 404)
 
-    _r2_delete_key(last.get("pdf_r2_key", ""))
-    with _cleanup_lock:
-        _persist_state_locked()
+        manager = ctx["manager"]
+        last = manager.undo_last()
+        if last is None:
+            return _error("No hay escaneos para deshacer.", 400, ctx)
 
-    return jsonify(
-        {
-            "ok": True,
-            "msg": f"Se deshizo {last['id']}.pdf",
-            **_status_payload(),
-        }
-    )
+        _delete_entry_files(last)
+        _persist_state_locked(code, ctx)
+
+        return jsonify(
+            {
+                "ok": True,
+                "session_code": code,
+                "msg": f"Se deshizo {last['id']}.pdf",
+                **_status_payload(ctx),
+            }
+        )
 
 
 @app.route("/download-zip", methods=["GET"])
 def download_zip():
-    scope = (request.args.get("scope") or "session").strip().lower()
+    code = _get_requested_session_code()
+    if not code:
+        return _error("Debes ingresar un codigo de jornada.", 400)
 
-    if scope == "all":
-        pdf_paths = sorted(
-            [
-                p
-                for p in OUTPUT_DIR.glob("*.pdf")
-                if p.is_file()
-            ],
-            key=lambda x: x.name,
-        )
-        filename_prefix = "todos"
-        if not pdf_paths:
-            return _error("No hay PDFs para comprimir.", 404)
-        zip_buffer = _build_zip_from_paths(pdf_paths)
-    else:
-        history_items = list(manager.history)
-        filename_prefix = "jornada"
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return _error("Jornada no encontrada.", 404)
+
+        history_items = list(ctx["manager"].history)
         if not history_items:
-            return _error("No hay PDFs para comprimir.", 404)
-        zip_buffer = _build_zip_from_history(history_items)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    download_name = f"scans_{filename_prefix}_{timestamp}.zip"
+            return _error("No hay PDFs para comprimir.", 404, ctx)
 
-    if scope == "session":
-        _mark_zip_downloaded()
+        zip_buffer = _build_zip_from_history(history_items)
+        ctx["meta"]["zip_downloaded_at"] = time.time()
+        _persist_state_locked(code, ctx)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    download_name = f"scans_{code}_{timestamp}.zip"
 
     return send_file(
         zip_buffer,
@@ -623,23 +758,30 @@ def download_zip():
 
 @app.route("/pdf/<string:id_value>", methods=["GET"])
 def view_pdf(id_value):
-    safe_id = Path(id_value).name.replace(".pdf", "")
-    pdf_path = OUTPUT_DIR / f"{safe_id}.pdf"
+    code = _get_requested_session_code()
+    if not code:
+        return "Debes ingresar codigo de jornada", 400
 
-    if pdf_path.exists():
-        return send_file(pdf_path, mimetype="application/pdf")
+    with _state_lock:
+        ctx = _get_context_locked(code, create_if_missing=False)
+        if ctx is None:
+            return "Jornada no encontrada", 404
 
-    entry = next((item for item in manager.history if str(item.get("id", "")) == safe_id), None)
-    if entry:
-        pdf_r2_key = entry.get("pdf_r2_key", "")
-    else:
-        pdf_r2_key = _build_r2_key(R2_PREFIX, "pdfs", f"{_safe_key_part(safe_id)}.pdf")
+        manager = ctx["manager"]
+        safe_id = Path(id_value).name.replace(".pdf", "")
+        entry = next((item for item in manager.history if str(item.get("id", "")) == safe_id), None)
+        if entry is None:
+            return "PDF no encontrado", 404
 
-    content = _r2_get_bytes(pdf_r2_key)
-    if not content:
-        return "PDF no encontrado", 404
+        pdf_path = Path(entry.get("pdf", "")) if entry.get("pdf") else None
+        if pdf_path and pdf_path.exists():
+            return send_file(pdf_path, mimetype="application/pdf")
 
-    return send_file(io.BytesIO(content), mimetype="application/pdf", download_name=f"{safe_id}.pdf")
+        content = _r2_get_bytes(entry.get("pdf_r2_key", ""))
+        if not content:
+            return "PDF no encontrado", 404
+
+        return send_file(io.BytesIO(content), mimetype="application/pdf", download_name=f"{safe_id}.pdf")
 
 
 if __name__ == "__main__":

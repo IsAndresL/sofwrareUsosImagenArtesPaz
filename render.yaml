@@ -9,7 +9,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: CLEANUP_AFTER_ZIP_SECONDS
-        value: 900
+        value: 86400
       - key: INACTIVITY_CLEANUP_SECONDS
         value: 0
       - key: CLEANUP_POLL_SECONDS

@@ -115,6 +115,14 @@ body {
   max-width: 72ch;
 }
 
+.session-row {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
 .brand-pill {
   flex: 0 0 auto;
   align-self: center;
@@ -621,6 +629,10 @@ video,
 
   .head-top {
     flex-direction: column;
+  }
+
+  .session-row {
+    grid-template-columns: 1fr;
   }
 
   .head-side {
