@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scanner Inteligente</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body data-startup-message="{{ startup_message }}" data-render-idle-seconds="{{ render_idle_seconds }}">
+  <main class="wrap">
+    <header class="head">
+      <div class="head-top">
+        <div>
+          <p class="eyebrow">Sistema de captura y organizacion</p>
+          <h1>Scanner inteligente de formularios</h1>
+        </div>
+        <div class="head-side">
+          <div id="serverIndicator" class="server-indicator offline" aria-live="polite">
+            <span id="serverDot" class="server-dot"></span>
+            <div class="server-texts">
+              <span id="serverLabel">Servidor desconectado</span>
+              <small id="renderIdleCountdown" class="server-sub">Inactividad: --:--</small>
+            </div>
+          </div>
+          <span class="brand-pill">Ing. Andres Luna</span>
+        </div>
+      </div>
+      <p class="head-copy">Sube una fuente de datos, selecciona personas y escanea en orden con una interfaz clara, rapida y responsive.</p>
+    </header>
+
+    <div id="statusBanner" class="status-banner" aria-live="polite">
+      <span id="statusText">Listo.</span>
+      <div class="status-track"><div id="statusBar" class="status-bar"></div></div>
+    </div>
+
+    <div class="dashboard">
+      <div class="dashboard-col">
+        <section class="panel" aria-labelledby="fuente-title">
+          <div class="panel-head">
+            <h2 id="fuente-title">Fuente de datos</h2>
+            <span class="pill" id="sourceFile">Sin archivo</span>
+          </div>
+
+          <div class="grid source-grid">
+            <input id="sourceInput" type="file" accept=".xlsx,.xls" class="input" />
+            <button id="btnUploadSource" class="btn soft" type="button">Subir caracterizacion</button>
+          </div>
+
+          <small class="hint">
+            Excel esperado: NÚMERO DE IDENTIFICACIÓN, PRIMER APELLIDO, SEGUNDO APELLIDO, PRIMER NOMBRE, SEGUNDO NOMBRE.
+          </small>
+
+          <div class="preview-panel">
+            <div class="panel-head compact">
+              <h3>Seleccion de personas</h3>
+              <span class="pill" id="selectionInfo">0 seleccionadas</span>
+            </div>
+
+            <div class="grid preview-tools">
+              <input id="searchInput" type="search" class="input" placeholder="Buscar por nombre o ID" />
+              <div class="select-all-box">
+                <input id="chkToggleAll" type="checkbox" />
+                <label for="chkToggleAll">Marcar o desmarcar todos (visibles)</label>
+              </div>
+            </div>
+
+            <div id="excelPreview" class="excel-preview"></div>
+          </div>
+
+          <div class="grid action-row">
+            <button id="btnApplySelection" class="btn soft" type="button">Aplicar seleccion</button>
+            <button id="btnResetSession" class="btn warn" type="button">Reiniciar jornada</button>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="turno-title">
+          <div class="panel-head">
+            <h2 id="turno-title">Persona en turno</h2>
+            <span class="pill success" id="turnProgress">0/0</span>
+          </div>
+
+          <div class="persona-grid">
+            <div class="persona-card"><span>Identificacion</span><strong id="nextId">-</strong></div>
+            <div class="persona-card"><span>Nombre completo</span><strong id="nextName">-</strong></div>
+            <div class="persona-card"><span>Primer nombre</span><strong id="nextFirstName">-</strong></div>
+            <div class="persona-card"><span>Segundo nombre</span><strong id="nextSecondName">-</strong></div>
+            <div class="persona-card"><span>Primer apellido</span><strong id="nextFirstLastName">-</strong></div>
+            <div class="persona-card"><span>Segundo apellido</span><strong id="nextSecondLastName">-</strong></div>
+          </div>
+
+          <div class="meta-line">
+            <span>Total registros fuente: <b id="sourceTotal">0</b></span>
+            <span>Total seleccionadas: <b id="targetLabel">0</b></span>
+          </div>
+
+          <div class="progress-wrap" aria-label="Progreso">
+            <div class="progress-top">
+              <span id="txtProgress">Progreso: 0/0</span>
+              <span id="txtPercent">0%</span>
+            </div>
+            <div class="progress"><div id="bar" class="bar"></div></div>
+          </div>
+
+          <div class="status-note" id="selectionLockNote">La seleccion se desbloquea solo al cargar una nueva caracterizacion.</div>
+        </section>
+      </div>
+
+      <div class="dashboard-col dashboard-col-wide">
+        <section class="panel scanner-panel" aria-labelledby="scanner-title">
+          <div class="panel-head">
+            <h2 id="scanner-title">Escaner</h2>
+            <span class="pill">Camara + PDF</span>
+          </div>
+
+          <div class="camera-box">
+            <video id="video" autoplay playsinline></video>
+            <div id="previewWrap">
+              <img id="preview" alt="Vista previa" />
+              <canvas id="overlay"></canvas>
+            </div>
+            <canvas id="canvas"></canvas>
+          </div>
+
+          <div class="grid two">
+            <button id="btnActivarCamara" class="btn main" type="button">Activar camara</button>
+            <button id="btnAuto" class="btn soft" type="button">Auto-detectar esquinas</button>
+          </div>
+
+          <div class="grid two">
+            <button id="btnCapturar" class="btn main" type="button">Capturar</button>
+            <button id="btnGuardar" class="btn ok" type="button">Guardar PDF</button>
+          </div>
+
+          <div class="grid two">
+            <select id="filtro" class="input">
+              <option value="normal">Filtro: Normal</option>
+              <option value="bn">Filtro: Blanco y negro</option>
+              <option value="contraste">Filtro: Alto contraste</option>
+            </select>
+            <button id="btnVolver" class="btn soft" type="button">Volver a camara</button>
+          </div>
+
+          <div class="grid two">
+            <button id="btnUndo" class="btn soft" type="button">Deshacer ultimo</button>
+            <button id="btnLimpiar" class="btn warn" type="button">Limpiar vista</button>
+          </div>
+          <p id="info" class="info"></p>
+        </section>
+
+        <section class="panel export-panel" aria-labelledby="export-title">
+          <div class="panel-head">
+            <h2 id="export-title">Exportacion final</h2>
+            <span class="pill">ZIP</span>
+          </div>
+          <p class="hint">Descarga el ZIP de la jornada: solo lo escaneado en esta sesion. Por seguridad, el Excel y los PDFs de la sesion se eliminan automaticamente despues de un tiempo.</p>
+          <div class="grid">
+            <button id="btnZipSession" class="btn soft" type="button">Descargar ZIP de la jornada</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <div id="confirmModal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+      <h3 id="confirmTitle">Confirmar seleccion</h3>
+      <p id="confirmMessage">¿Deseas aplicar la seleccion? Al confirmar, la lista quedara bloqueada.</p>
+      <div class="modal-actions">
+        <button id="btnCancelConfirm" class="btn soft" type="button">Cancelar</button>
+        <button id="btnConfirmApply" class="btn main" type="button">Confirmar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

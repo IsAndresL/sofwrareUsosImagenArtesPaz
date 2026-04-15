@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: scanner-usos-imagen
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn servidor:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: CLEANUP_AFTER_ZIP_SECONDS
+        value: 900
+      - key: INACTIVITY_CLEANUP_SECONDS
+        value: 0
+      - key: CLEANUP_POLL_SECONDS
+        value: 30
+      - key: RENDER_IDLE_SECONDS
+        value: 900
+      - key: R2_PREFIX
+        value: scanner-usos-imagen

@@ -1,0 +1,19 @@
+# Entorno local
+.venv/
+
+# Cachés de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Salidas y datos de jornada
+fuentes/
+usos_separados/
+
+# Secretos y documentación local sensible
+README_R2_RENDER.md
+
+# Sistema
+.DS_Store
+Thumbs.db
